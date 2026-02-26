@@ -1,0 +1,299 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+    <title>Hand Math Game - Lite v5.1</title>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js" crossorigin="anonymous"></script>
+    <style>
+        body { 
+            margin: 0; padding: 0; background: #000; 
+            font-family: 'Arial Black', sans-serif; 
+            overflow: hidden; touch-action: none; color: white;
+            height: 100dvh;
+        }
+        #launcher {
+            display: flex; flex-direction: column; justify-content: center; align-items: center;
+            position: absolute; width: 100%; height: 100dvh; z-index: 100; background: #1a1a1a; text-align: center;
+        }
+        .start-btn {
+            padding: 20px 40px; font-size: 22px; font-weight: bold; cursor: pointer;
+            background: #0f0; color: #000; border: none; border-radius: 50px;
+            box-shadow: 0 5px 20px rgba(0,255,0,0.4);
+        }
+        .hint-text { margin-top: 20px; color: #ccc; font-size: 14px; padding: 0 20px; line-height: 1.6; }
+        
+        #game-container { display: none; position: relative; width: 100%; height: 100dvh; }
+        
+        canvas { 
+            position: absolute; top: 0; left: 0; 
+            width: 100vw; height: 100dvh; 
+            object-fit: cover; 
+            transform: scaleX(-1); 
+        }
+        
+        #ui-layer {
+            position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+            pointer-events: none; color: #0f0; text-shadow: 2px 2px #000;
+            z-index: 10;
+        }
+        .hud { position: absolute; top: 20px; font-size: clamp(24px, 7vw, 42px); font-weight: bold; }
+        #score-text { left: 20px; }
+        #time-text { right: 20px; }
+        #status-text { position: absolute; top: 12%; left: 0; width: 100%; font-size: 16px; color: #ffff00; text-align: center; }
+        
+        #question-area { position: absolute; top: 40%; left: 50%; transform: translate(-50%, -50%); text-align: center; width: 100%; }
+        .main-q { font-size: 40vw; line-height: 1; color: #f00; font-weight: bold; -webkit-text-stroke: 2px #fff; }
+        
+        .correct-circle {
+            position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+            width: 60vw; height: 60vw; border: 15px solid #f00; border-radius: 50%; display: none;
+            box-shadow: 0 0 30px rgba(255,0,0,0.5); z-index: 20;
+        }
+
+        #mobile-controls { 
+            position: absolute; bottom: max(20px, env(safe-area-inset-bottom));
+            left: 0; width: 100%; display: flex; justify-content: center; gap: 8px; z-index: 50; padding: 0 10px; box-sizing: border-box;
+        }
+        .ctrl-btn { 
+            flex: 1; max-width: 110px; padding: 12px 5px; background: rgba(0,0,0,0.7); 
+            color: #0f0; border: 1px solid #0f0; border-radius: 8px; font-size: 13px; pointer-events: auto;
+        }
+    </style>
+</head>
+<body>
+
+<div id="launcher">
+    <h1 style="font-size: 24px;">指計算ゲーム Lite</h1>
+    <button class="start-btn" onclick="startApp()">ゲームを開始</button>
+    <div class="hint-text">カメラを自分に向け、手首を画面の<br><b>上半分</b>に挙げるとスタート！</div>
+</div>
+
+<div id="game-container">
+    <video id="input_video" style="display:none;" playsinline muted></video>
+    <canvas id="output_canvas"></canvas>
+    <div id="ui-layer">
+        <div class="hud" id="score-text">Score: 0</div>
+        <div class="hud" id="time-text">Time: 60</div>
+        <div id="status-text">Ready...</div>
+        <div id="question-area">
+            <div id="main-q" class="main-q"></div>
+            <div id="correct-circle" class="correct-circle"></div>
+        </div>
+    </div>
+    <div id="mobile-controls">
+        <button class="ctrl-btn" onclick="setMode(1)">音声モード</button>
+        <button class="ctrl-btn" onclick="setMode(0)">表示モード</button>
+        <button class="ctrl-btn" onclick="location.reload()">再起動</button>
+    </div>
+</div>
+
+<script>
+    const videoElement = document.getElementById('input_video');
+    const canvasElement = document.getElementById('output_canvas');
+    const canvasCtx = canvasElement.getContext('2d', {alpha: false}); // 最適化
+    const scoreText = document.getElementById('score-text');
+    const timeText = document.getElementById('time-text');
+    const statusText = document.getElementById('status-text');
+    const mainQ = document.getElementById('main-q');
+    const correctCircle = document.getElementById('correct-circle');
+
+    let score = 0, timeLeft = 60, gameStarted = false, isWaitingStartVoice = false;
+    let voiceMode = 0, currentAns = 0, lastAns = -1, isCorrecting = false;
+    let startTime = 0, audioCtx = null;
+    let lastStableCount = -1, stableFrames = 0;
+
+    const START_Y_LINE = 0.4; // 画面上部40%に入ったらスタート
+
+    function safeSpeak(text, callback) {
+        window.speechSynthesis.cancel();
+        const uttr = new SpeechSynthesisUtterance(text);
+        uttr.lang = 'ja-JP';
+        uttr.onend = () => { if(callback) callback(); };
+        window.speechSynthesis.speak(uttr);
+    }
+
+    async function startApp() {
+        document.getElementById('launcher').style.display = 'none';
+        document.getElementById('game-container').style.display = 'block';
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        
+        const hands = new Hands({ locateFile: (f) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${f}` });
+        hands.setOptions({ 
+            maxNumHands: 2, 
+            modelComplexity: 0, // 0は最軽量モデル
+            minDetectionConfidence: 0.5, 
+            minTrackingConfidence: 0.5 
+        });
+        hands.onResults(onResults);
+
+        const camera = new Camera(videoElement, {
+            onFrame: async () => { await hands.send({image: videoElement}); },
+            width: 640, height: 480 // 解像度を落として負荷軽減
+        });
+        camera.start();
+        statusText.textContent = "手首を画面上部へ！";
+    }
+
+    function beep() {
+        if(!audioCtx) return;
+        const osc = audioCtx.createOscillator();
+        const gain = audioCtx.createGain();
+        osc.connect(gain); gain.connect(audioCtx.destination);
+        osc.frequency.setValueAtTime(880, audioCtx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + 0.1);
+        osc.start(); osc.stop(audioCtx.currentTime + 0.1);
+    }
+
+    function initGame() {
+        if (isWaitingStartVoice || gameStarted) return;
+        isWaitingStartVoice = true;
+        score = 0; timeLeft = 60;
+        scoreText.textContent = "Score: 0";
+        statusText.textContent = "";
+        
+        safeSpeak("スタート", () => {
+            isWaitingStartVoice = false;
+            gameStarted = true;
+            startTime = Date.now();
+            generateQuestion();
+        });
+    }
+
+    function generateQuestion() {
+        let n1, n2, op, newAns;
+        do {
+            op = Math.random() < 0.5 ? '+' : '-';
+            if (op === '+') {
+                n1 = Math.floor(Math.random() * 9) + 1;
+                n2 = Math.floor(Math.random() * (10 - n1)) + 1;
+                newAns = n1 + n2;
+            } else {
+                n1 = Math.floor(Math.random() * 8) + 2;
+                n2 = Math.floor(Math.random() * (n1 - 1)) + 1;
+                newAns = n1 - n2;
+            }
+        } while (newAns === lastAns || newAns > 10);
+        
+        currentAns = newAns;
+        lastAns = currentAns;
+
+        if (voiceMode === 1) {
+            mainQ.textContent = "?";
+            safeSpeak(`${n1}${op === '+' ? 'たす' : 'ひく'}${n2}`);
+        } else {
+            mainQ.textContent = `${n1}${op}${n2}`;
+        }
+    }
+
+    // 指判定ロジックの改善
+    function analyzeFingers(lm, label) {
+        let count = 0;
+        const wrist = lm[0];
+        
+        // 親指: 第2関節と先端の水平距離で判定（掌の向きに依存しにくい方法）
+        const thumbTip = lm[4];
+        const thumbBase = lm[2];
+        const isRight = label === 'Right';
+        // 鏡像反転を考慮: Rightラベルでも画面上は左側
+        if (isRight ? thumbTip.x < thumbBase.x - 0.02 : thumbTip.x > thumbBase.x + 0.02) {
+            count++;
+        }
+
+        // 4本の指: 第2関節(PIP)より先端(Tip)が上にあるか
+        const fingerIndices = [8, 12, 16, 20];
+        for (let idx of fingerIndices) {
+            if (lm[idx].y < lm[idx - 2].y) {
+                count++;
+            }
+        }
+        return count;
+    }
+
+    function onResults(results) {
+        // キャンバスリサイズ処理の軽量化
+        if (canvasElement.width !== window.innerWidth) {
+            canvasElement.width = window.innerWidth;
+            canvasElement.height = window.innerHeight;
+        }
+
+        canvasCtx.save();
+        canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
+        
+        let totalFingers = 0;
+        let startTrigger = false;
+
+        if (results.multiHandLandmarks) {
+            for (let i = 0; i < results.multiHandLandmarks.length; i++) {
+                const landmarks = results.multiHandLandmarks[i];
+                const label = results.multiHandedness[i].label;
+                
+                // 描画を軽量化（点と線のみ）
+                drawConnectors(canvasCtx, landmarks, HAND_CONNECTIONS, {color: '#00FF00', lineWidth: 2});
+                
+                totalFingers += analyzeFingers(landmarks, label);
+
+                // スタート判定（手首の位置）
+                if (!gameStarted && !isWaitingStartVoice && landmarks[0].y < START_Y_LINE) {
+                    startTrigger = true;
+                }
+            }
+        }
+
+        if (startTrigger) initGame();
+
+        if (gameStarted && !isCorrecting) {
+            const elapsed = Math.floor((Date.now() - startTime) / 1000);
+            timeLeft = Math.max(0, 60 - elapsed);
+            timeText.textContent = `Time: ${timeLeft}`;
+
+            if (timeLeft <= 0) {
+                gameStarted = false;
+                mainQ.textContent = "FINISH";
+                safeSpeak(`終了。スコアは${score}点でした。`);
+            }
+
+            // チャタリング防止: 3フレーム連続で同じ数字なら確定
+            if (totalFingers === currentAns && totalFingers !== 0) {
+                stableFrames++;
+                if (stableFrames >= 3) {
+                    processCorrect();
+                }
+            } else {
+                stableFrames = 0;
+            }
+        }
+        canvasCtx.restore();
+    }
+
+    function processCorrect() {
+        isCorrecting = true;
+        score++;
+        scoreText.textContent = `Score: ${score}`;
+        beep();
+        correctCircle.style.display = "block";
+        mainQ.textContent = currentAns;
+        
+        setTimeout(() => {
+            correctCircle.style.display = "none";
+            isCorrecting = false;
+            stableFrames = 0;
+            if (gameStarted) generateQuestion();
+        }, 800);
+    }
+    
+    function setMode(m) { 
+        voiceMode = m; 
+        safeSpeak(m === 1 ? "音声モード" : "表示モード"); 
+    }
+
+    // 画面リサイズ対応
+    window.addEventListener('resize', () => {
+        canvasElement.width = window.innerWidth;
+        canvasElement.height = window.innerHeight;
+    });
+</script>
+</body>
+</html>
